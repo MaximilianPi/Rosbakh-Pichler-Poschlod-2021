@@ -1,0 +1,2 @@
+## Rosbakh, Pichler, and Poschlod - 2021 
+Code to replicate the analysis of Rosbakh, Pichler, and Poschlod 2021 'Machine learning algorithms predict soil seed bank persistence from easily available traits'.

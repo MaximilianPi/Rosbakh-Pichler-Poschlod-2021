@@ -1,0 +1,456 @@
+---
+title: "ML Predictions"
+author: "Maximilian Pichler"
+date: "`r format(Sys.time(), '%d %B, %Y')`"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+## Dependencies
+```{r}
+library(readxl)
+library(missRanger)
+library(tidyverse)
+library(mlr3)
+library(mlr3tuning)
+library(paradox)
+library(mlr3learners)
+library(dplyr)
+library(ape) 
+library(phytotools)
+library(geiger)
+library(PVR)
+library(DALEX)
+library(ingredients)
+set.seed(42)
+```
+
+
+## Data preparation
+Load train and test data (aim of this analysis is to predict SBPA for the test data)
+Warnings can be ignored, 'NA' will be correctly converted to NA
+```{r}
+train = read_xlsx('Data/soil seed bank.xlsx', 1)
+test = read_xlsx('Data/full data set.xlsx', 1,col_types = "text")
+raw_result = read_xlsx('Data/full data set.xlsx', 1,col_types = "text")
+
+train = 
+  train %>% 
+    mutate(Plot = as.factor(Plot),
+           Species = as.factor(Species),
+           SBDensity = as.numeric(SBDensity),
+           Altitude = as.numeric(Altitude),
+           Cover = as.numeric(Cover),
+           Shape = as.numeric(Shape), 
+           Weight = as.numeric(Weight),
+           Productivity = as.numeric(Productivity),
+           Dormancy = as.factor(Dormancy), # could be a factor as well -> M: I will treat it as a factor for the imputation
+           Endosperm = as.factor(Endosperm),
+           SBPA = as.factor(SBPA),
+           dataset = as.factor(rep("train", nrow(train)))) %>% 
+           filter(!Cover == 0.0) %>% 
+           select(-Altitude, -Cover) 
+    as.data.frame
+
+test = 
+  test %>% 
+    mutate(Plot = as.factor(Plot),
+           Species = as.factor(Species),
+           SBDensity = rep(NA, nrow(test)), 
+           Altitude = as.numeric(Altitude),
+           Cover = as.numeric(Cover),
+           Shape = as.numeric(Shape), 
+           Weight = as.numeric(Weight),
+           Productivity = as.numeric(Productivity),
+           Dormancy = as.factor(Dormancy), # could be a factor as well -> M: I will treat it as a factor for the imputation
+           Endosperm = as.factor(Endosperm),
+           SBPA = rep(NA, nrow(test)),
+           dataset = as.factor(rep("test", nrow(test))),
+           N = as.numeric(N),
+           T = as.numeric(T),
+           F = as.numeric(F),
+           Grazing = as.numeric(Grazing)
+           
+    ) %>% 
+    filter(!Cover == 0.0) %>% 
+    select(-TrainingData, -Altitude,-Cover) %>% 
+    as.data.frame
+
+cat("Rate of new species in the train dataset: ", mean(unique(test$Species) %in% unique(train$Species)))
+
+data = rbind(train, test)
+
+```
+
+
+### Adding phlyogenetic eigenvectors ( following the "phylogeny" script )
+I decided to use only the n eigenvectors that explain maximal 60% of the variance to reduce the overall number of predictors
+```{r}
+Species = 
+  data %>% 
+    count(Species) %>% 
+    as.data.frame
+phyl = read.tree(file = "Data/DaPhnE_01.tre")
+
+rownames(Species) = Species[,1] 
+obj = name.check(phyl, Species)
+
+# drop the species 
+phyl.upd = drop.tip(phyl, obj$tree_not_data)
+summary (phyl.upd)
+
+# check the names in the tree and in the data set
+name.check(phyl.upd, Species)
+phyl.upd2 = multi2di(phyl.upd)
+
+# phylogenetic vectors
+decomp = PVRdecomp(phyl.upd2)
+label.decomp = as.data.frame(decomp@phylo$tip.label) #species names
+egvec = as.data.frame(decomp@Eigen$vectors) #extract eigenvectors
+egval = decomp@Eigen$values #extract eigenvalues
+eigPerc = egval/(sum(egval)) #calculate % of variance
+eigPercCum = t(cumsum(eigPerc)) #cumulated variance
+
+egOK = egvec[, which(eigPercCum[1,] <0.6, arr.ind = TRUE)]
+eigenTobind = cbind(label.decomp,egOK) #eigenvectors to merge with trait database
+names(eigenTobind)[1] = "Species"
+
+data = 
+  data %>% left_join(eigenTobind, by = "Species")
+str(data)
+```
+
+
+
+### Compare train and test dataset to estimate the level of extrapolation
+```{r}
+
+plot_hist = function(name) {
+  h1 = hist(data[[name]][data$dataset=="train"], main = paste0("Train - ", name), xlab = name)                   
+  h2 = hist(data[[name]][data$dataset=="test"], main = paste0("Test - ", name), xlab = name, ylab = "Frequency")                     
+  plot(h2, col=rgb(0,0,1,1/4), main = name, xlab = name)
+  plot(h1, col=rgb(1,0,0,1/4), add=TRUE)
+  legend("topright", bty="n", col = c(rgb(0,0,1,1/4), rgb(1,0,0,1/4)), pch = 15, legend = c("test", "train"))
+}
+
+par(mfrow = c(4,3))
+plot_hist("T")
+plot_hist("F")
+plot_hist("N")
+plot_hist("Grazing")
+plot_hist("Weight")
+plot_hist("Shape")
+plot_hist("Productivity")
+```
+
+
+### Imputation of NA
+NA will be imputed by missRanger (randomForest)
+```{r}
+dat = data %>% select(-Plot, -Species, -SBDensity, -SBPA, -dataset)
+dat$Dormancy[dat$Dormancy=="NA"] = NA
+dat$Dormancy = droplevels(dat$Dormancy)
+imputed = missRanger(data = dat)
+dat = cbind(data$Plot,data$Species, data$SBDensity, data$SBPA, data$dataset, imputed)
+colnames(dat)[1:5] = c("Plot", "Species", "SBDensity", "SBPA", "dataset")
+dat$Dormancy = as.integer(dat$Dormancy) - 1L # back to integer
+saveRDS(dat, file = "Results/reference_data.RDS")
+```
+
+
+### Prepare CV splits
+We will split the train dataset after the Plot ID (18 Plots) and use in each split 2 plots as test data for the model which was fitted on the other 16 plots (9-fold CV)
+```{r}
+resampling = rsmp("custom")
+Plots = droplevels( data$Plot[data$dataset=="train"] ) # 18 unique plots length(unique(Plots))
+splits = matrix(sample.int(18), ncol = 2L)
+test_sets = lapply(1:9, function(i) which(data$Plot[data$dataset=="train"] %in% levels(Plots)[splits[i,]]))
+train_sets = lapply(1:9, function(i) which(!data$Plot[data$dataset=="train"] %in% levels(Plots)[splits[i,]]))
+
+splits = cut(sample.int(length(data$Plot[data$dataset=="train"] )), breaks = 9)
+test_sets = lapply(1:9, function(i) which(splits %in% levels(splits)[i]))
+train_sets = lapply(1:9, function(i) which(!splits %in% levels(splits)[i]))
+```
+
+### Prepare data
+```{r}
+complete = dat %>% 
+  select(-dataset) %>% 
+  select(-Plot) %>% 
+  select(-Species) %>% 
+  mutate(Endosperm = as.integer(Endosperm)-1)
+
+complete_scaled = data.frame(cbind(complete[,1:2], scale(complete[,3:ncol(complete)])))
+complete_scaled$SBDensity = log(complete_scaled$SBDensity+0.001)
+saveRDS(complete_scaled, file = "Results/cleaned_data.RDS")
+```
+
+### Predictor groups
+```{r}
+seed = which(colnames(complete_scaled) %in% c("Endosperm", "Weight", "Shape", "Productivity", "Dormancy"))
+env = which(colnames(complete_scaled) %in% c("T", "F", "N", "Grazing"))
+predictor_groups = list(
+  all = 3:ncol(complete_scaled),
+  pyhlogenetic = grep( "c+[0-9]+",colnames(complete_scaled)),
+  seed = seed,
+  env = env
+)
+predictor_groups$phylo_seed = c(predictor_groups$pyhlogenetic, predictor_groups$seed)
+predictor_groups$phylo_env= c(predictor_groups$pyhlogenetic, predictor_groups$env)
+predictor_groups$env_seed = c(predictor_groups$seed, predictor_groups$env)
+
+```
+
+
+## Classification
+#### Fit and evlauate
+```{r}
+
+auc = msr("classif.auc")
+
+which_SBPA = which(colnames(complete_scaled) == "SBPA", arr.ind = TRUE)
+
+results_classification = array(NA, dim = c(length(predictor_groups), 2, 9))
+
+for(i in 1:length(predictor_groups)){
+
+  task = mlr3::TaskClassif$new(id = "data", 
+                               backend = complete_scaled[dat$dataset=="train",c(which_SBPA, predictor_groups[[i]])], 
+                               target = "SBPA", positive = "1")
+  resampling$instantiate(task, train_sets, test_sets)
+  
+  learner_rf = lrn("classif.ranger", predict_type = "prob", importance = "impurity", regularization.usedepth = TRUE)
+  result_rf = resample(task, learner_rf, resampling, store_models = TRUE)
+  res = result_rf$score(auc)
+  results_classification[i,1,] =  res$classif.auc
+  
+  learner_log_reg= lrn("classif.log_reg", predict_type = "prob")
+  result_log_reg = resample(task, learner_log_reg, resampling, store_models = TRUE)
+  res = result_log_reg$score(auc)
+  results_classification[i,2,] =  res$classif.auc
+}
+par(mfrow = c(1,2))
+names = c("All", "Phylo", "Seed", "Env", "Phlyo+Seed", "Phylo+Env", "Env+Seed")
+ord = order(apply(t(results_classification[,1,]), 2, mean), decreasing = TRUE)
+par(mar = c(8,2.4,2.4,2.4))
+boxplot(t(results_classification[,1,])[,ord], main = "RF PA", names = rep("",7), ylim = c(0.5, 1.0), las = 1)
+text(x = 1:7 + 0.5, y = 0.45, labels = names[ord], srt = 90, xpd = NA, pos = 2,)
+
+boxplot(t(results_classification[,2,])[,ord], main = "log reg PA", names = rep("",7), ylim = c(0.5, 1.0),las=1)
+text(x = 1:7 + 0.5, y = 0.45, labels = names[ord], srt = 90, xpd = NA, pos = 2,)
+
+task = mlr3::TaskClassif$new(id = "data", 
+                             backend = complete_scaled[dat$dataset=="train",c(which_SBPA, predictor_groups$all)], 
+                             target = "SBPA", positive = "1")
+model_rf = learner_rf$train(task)
+imp = model_rf$importance()
+par(mfrow = c(1,1))
+bb = barplot(imp,names.arg = "", las = 1)
+text(x = bb[,1]+0.3, y = -4, labels = names(imp), xpd = NA, srt = 90, pos = 2)
+pred_rf = model_rf$predict(TaskClassif$new(id = "data", backend = complete_scaled[dat$dataset=="test",], target = "SBPA", positive = "1"))
+
+model_log_reg = learner_log_reg$train(task)
+pred_log_reg = model_log_reg$predict(TaskClassif$new(id = "data", backend = complete_scaled[dat$dataset=="test",], target = "SBPA", positive = "1"))
+
+test$SBPA_rf_wo_cover = pred_rf$data$prob[,1]
+
+```
+
+#### Model diagnostic Classification
+```{r}
+par(mfrow = c(1,1))
+hist(pred_rf$data$prob[,1], xlab = "SBPA Probability", main = "Predictions")
+
+explainer = function(object, newdata){
+  preds = object$predict_newdata(newdata=newdata)
+  return(preds$data$prob[,1])
+}
+
+# RF
+model_explainer_rf = DALEX::explain(model_rf, 
+                                    data=complete_scaled[dat$dataset=="train",c(-which_SBPA)], 
+                                    y=as.integer(complete_scaled[dat$dataset=="train",which_SBPA])-1L,
+                                    predict_function = explainer, label = "RF")
+dp = conditional_dependence(model_explainer_rf, variables = names(model_rf$importance())[1:12])
+plot(dp)
+
+```
+
+
+### Cumulative prediction
+
+```{r}
+importance = model_rf$importance()
+
+results_classification_cumulative = array(NA, dim = c(length(importance), 9))
+
+for(i in 1:length(importance)){
+  sub = names(sort(importance, decreasing = TRUE))[1:i] 
+  tmp = which(colnames(complete_scaled) %in% sub)
+
+  task = mlr3::TaskClassif$new(id = "data", 
+                               backend = complete_scaled[dat$dataset=="train",c(which_SBPA, tmp)], 
+                               target = "SBPA", positive = "1")
+  resampling$instantiate(task, train_sets, test_sets)
+  
+  learner_rf = lrn("classif.ranger", predict_type = "prob", importance = "impurity", regularization.usedepth = TRUE)
+  result_rf = resample(task, learner_rf, resampling, store_models = TRUE)
+  res = result_rf$score(auc)
+  results_classification_cumulative[i,] =  res$classif.auc
+  
+}
+
+```
+
+
+
+```{r}
+saveRDS(list(classification_rf = results_classification, 
+             names =  c("All", "Phylo", "Seed", "Env", "Phlyo+Seed", "Phylo+Env", "Env+Seed"),
+             rf = model_rf,
+             lm = model_log_reg,
+             cumulative = list(
+               results = results_classification_cumulative,
+               names =  names(sort(importance, decreasing = TRUE))
+             )), file = "Results/classification.RDS")
+```
+
+
+
+## Regression with SPBDensity
+```{r}
+
+results_regression = array(NA, dim = c(length(predictor_groups), 2, 9))
+rsq = msr("regr.rsq")
+
+which_SBDensity = which(colnames(complete_scaled) == "SBDensity", arr.ind = TRUE)
+
+for(i in 1:length(predictor_groups)){
+
+  task = mlr3::TaskRegr$new(id = "data", 
+                               backend = complete_scaled[dat$dataset=="train",c(which_SBDensity, predictor_groups[[i]])], 
+                               target = "SBDensity")
+  resampling$instantiate(task, train_sets, test_sets)
+  learner_rf = lrn("regr.ranger", importance = "impurity", regularization.usedepth = TRUE)
+  
+  
+  result_rf = resample(task, learner_rf, resampling, store_models = TRUE)
+  res = result_rf$score(rsq)
+  results_regression[i,1,] =  res$regr.rsq
+  
+  learner_lm= lrn("regr.lm")
+  result_lm = resample(task, learner_lm, resampling, store_models = TRUE)
+  res = result_lm$score(rsq)
+  results_regression[i,2,] =  res$regr.rsq
+
+}
+```
+
+### Results Regression
+```{r}
+par(mfrow = c(1,2))
+names = c("All", "Phylo", "Seed", "Env", "Phlyo+Seed", "Phylo+Env", "Env+Seed")
+par(mar = c(8,2.4,2.4,2.4))
+ord = order(apply(t(results_classification[,1,]), 2, mean), decreasing = TRUE)
+boxplot(t(results_regression[,1,])[,ord], main = "RF Density", names = rep("",7), ylim = c(0.0, 1), las = 1)
+text(x = 1:7 + 0.5, y = -0.1, labels = names[ord], srt = 90, xpd = NA, pos = 2,)
+
+boxplot(t(results_regression[,2,])[,ord], main = "LM Density", names = rep("",7), ylim = c(0.0, 1), las = 1)
+text(x = 1:7 + 0.5, y = -0.1, labels = names[ord], srt = 90, xpd = NA, pos = 2,)
+
+```
+
+### Create predictions
+```{r}
+  task = mlr3::TaskRegr$new(id = "data", 
+                               backend = complete_scaled[dat$dataset=="train",c(which_SBDensity, predictor_groups$all)], 
+                               target = "SBDensity")
+model_rf = learner_rf$train(task)
+imp = model_rf$importance()
+par(mfrow = c(1,1), oma=c(1,2,1,1))
+bb = barplot(imp,names.arg = "", las = 1)
+text(x = bb[,1]+0.3, y = -20, labels = names(imp), xpd = NA, srt = 90, pos = 2)
+
+
+pred_rf = model_rf$predict(TaskRegr$new(id = "data", backend = complete_scaled[dat$dataset=="test",], target = "SBDensity"))
+
+
+test$SBDensity_rf_wo_cover = exp(pred_rf$data$response)-0.001
+
+
+
+```
+
+### Cumulative prediction
+```{r}
+importance = model_rf$importance()
+
+results_regression_cumulative = array(NA, dim = c(length(importance), 9))
+
+for(i in 1:length(importance)){
+  sub = names(sort(importance, decreasing = TRUE))[1:i] 
+  tmp = which(colnames(complete_scaled) %in% sub)
+
+  task = mlr3::TaskRegr$new(id = "data", 
+                               backend = complete_scaled[dat$dataset=="train",c(which_SBDensity, tmp)], 
+                               target = "SBDensity")
+  resampling$instantiate(task, train_sets, test_sets)
+  result_rf = resample(task, learner_rf, resampling, store_models = TRUE)
+  res = result_rf$score(rsq)
+  results_regression_cumulative[i,] =  res$regr.rsq
+  
+}
+
+
+```
+
+
+
+```{r}
+saveRDS(list(regression = results_regression, 
+             names =  c("All", "Phylo", "Seed", "Env", "Phlyo+Seed", "Phylo+Env", "Env+Seed"),
+             rf = model_rf,
+             lm = model_log_reg,
+             cumulative = list(
+               results = results_regression_cumulative,
+               names =  names(sort(importance, decreasing = TRUE))
+             )), file = "Results/regression.RDS")
+
+```
+
+
+### Check predictions on train
+```{r}
+par(mfrow = c(1,2), mar = c(4,4,2,2))
+  task = mlr3::TaskRegr$new(id = "data", 
+                               backend = complete_scaled[dat$dataset=="train",c(which_SBDensity, predictor_groups$all)], 
+                               target = "SBDensity")
+
+plot(NULL, NULL, ylim = c(0, 12), xlim = c(0,12), xlab = "truth", ylab="predictions", las = 1, main = "RF")
+for(i in 1:9){
+  model_rf = learner_rf$train(task,row_ids = train_sets[[i]])
+  model_rf$importance()
+  pred_rf = model_rf$predict(task,row_ids = test_sets[[i]])
+  
+  points(pred_rf$data$truth, pred_rf$data$response)
+}
+
+plot(NULL, NULL, ylim = c(0, 12), xlim = c(0,12), xlab = "truth", ylab="predictions", las = 1, main = "kNN")
+for(i in 1:9){
+  model_lm = learner_lm$train(task,row_ids = train_sets[[i]])
+  pred_lm = model_lm$predict(task,row_ids = test_sets[[i]])
+  
+  points(pred_lm$data$truth, pred_lm$data$response)
+}
+```
+
+
+
+## Save predictions
+```{r}
+write.csv(test, file = "results/full_data_w_predictions.csv")
+```
+
