@@ -6,7 +6,7 @@ output: html_document
 ---
 
 ```{r setup, include=FALSE}
-knitr::opts_chunk$set(echo = TRUE)
+knitr::opts_chunk$set(echo = TRUE, results='hide', cache = TRUE)
 ```
 
 ## Dependencies
@@ -16,8 +16,9 @@ library(missRanger)
 library(tidyverse)
 library(mlr3)
 library(mlr3tuning)
-library(paradox)
 library(mlr3learners)
+library(mlr3pipelines)
+library(paradox)
 library(dplyr)
 library(ape) 
 library(phytotools)
@@ -25,6 +26,8 @@ library(geiger)
 library(PVR)
 library(DALEX)
 library(ingredients)
+pop = po("modelmatrix", formula = ~ .  ^ 2)
+add_interactions = function(lrn) GraphLearner$new(pop %>>% lrn )
 set.seed(42)
 ```
 
@@ -51,8 +54,8 @@ train =
            Endosperm = as.factor(Endosperm),
            SBPA = as.factor(SBPA),
            dataset = as.factor(rep("train", nrow(train)))) %>% 
-           filter(!Cover == 0.0) %>% 
-           select(-Altitude, -Cover) 
+           filter(Cover > 0.0) %>% 
+           select(-Altitude) 
     as.data.frame
 
 test = 
@@ -75,8 +78,8 @@ test =
            Grazing = as.numeric(Grazing)
            
     ) %>% 
-    filter(!Cover == 0.0) %>% 
-    select(-TrainingData, -Altitude,-Cover) %>% 
+    filter(Cover > 0.0) %>% 
+    select(-TrainingData, -Altitude) %>% 
     as.data.frame
 
 cat("Rate of new species in the train dataset: ", mean(unique(test$Species) %in% unique(train$Species)))
@@ -144,6 +147,7 @@ plot_hist("Grazing")
 plot_hist("Weight")
 plot_hist("Shape")
 plot_hist("Productivity")
+plot_hist("Cover")
 ```
 
 
@@ -191,7 +195,7 @@ saveRDS(complete_scaled, file = "Results/cleaned_data.RDS")
 ### Predictor groups
 ```{r}
 seed = which(colnames(complete_scaled) %in% c("Endosperm", "Weight", "Shape", "Productivity", "Dormancy"))
-env = which(colnames(complete_scaled) %in% c("T", "F", "N", "Grazing"))
+env = which(colnames(complete_scaled) %in% c("T", "F", "N", "Grazing", "Cover"))
 predictor_groups = list(
   all = 3:ncol(complete_scaled),
   pyhlogenetic = grep( "c+[0-9]+",colnames(complete_scaled)),
@@ -208,41 +212,47 @@ predictor_groups$env_seed = c(predictor_groups$seed, predictor_groups$env)
 ## Classification
 #### Fit and evlauate
 ```{r}
-
+future::plan("multisession")
 auc = msr("classif.auc")
 
 which_SBPA = which(colnames(complete_scaled) == "SBPA", arr.ind = TRUE)
 
 results_classification = array(NA, dim = c(length(predictor_groups), 2, 9))
 
+
 for(i in 1:length(predictor_groups)){
 
-  task = mlr3::TaskClassif$new(id = "data", 
-                               backend = complete_scaled[dat$dataset=="train",c(which_SBPA, predictor_groups[[i]])], 
+  task = mlr3::TaskClassif$new(id = paste0("SSB_", i), 
+                               backend = complete_scaled[dat$dataset=="train",c(which_SBPA, predictor_groups[[i]])],
                                target = "SBPA", positive = "1")
   resampling$instantiate(task, train_sets, test_sets)
   
   learner_rf = lrn("classif.ranger", predict_type = "prob", importance = "impurity", regularization.usedepth = TRUE)
-  result_rf = resample(task, learner_rf, resampling, store_models = TRUE)
+  result_rf = resample(task, learner_rf, resampling, store_models = TRUE, store_backends = TRUE)
   res = result_rf$score(auc)
   results_classification[i,1,] =  res$classif.auc
   
-  learner_log_reg= lrn("classif.log_reg", predict_type = "prob")
-  result_log_reg = resample(task, learner_log_reg, resampling, store_models = TRUE)
+  learner_log_reg = add_interactions( lrn("classif.cv_glmnet", predict_type = "prob", nfolds = 3) )
+  result_log_reg = resample(task, learner_log_reg, resampling, store_models = TRUE, store_backends = TRUE)
   res = result_log_reg$score(auc)
   results_classification[i,2,] =  res$classif.auc
 }
+
 par(mfrow = c(1,2))
 names = c("All", "Phylo", "Seed", "Env", "Phlyo+Seed", "Phylo+Env", "Env+Seed")
 ord = order(apply(t(results_classification[,1,]), 2, mean), decreasing = TRUE)
 par(mar = c(8,2.4,2.4,2.4))
 boxplot(t(results_classification[,1,])[,ord], main = "RF PA", names = rep("",7), ylim = c(0.5, 1.0), las = 1)
-text(x = 1:7 + 0.5, y = 0.45, labels = names[ord], srt = 90, xpd = NA, pos = 2,)
+text(x = 1:7 + 0.5, y = 0.45, labels = names[ord], srt = 90, xpd = NA, pos = 2)
 
 boxplot(t(results_classification[,2,])[,ord], main = "log reg PA", names = rep("",7), ylim = c(0.5, 1.0),las=1)
-text(x = 1:7 + 0.5, y = 0.45, labels = names[ord], srt = 90, xpd = NA, pos = 2,)
+text(x = 1:7 + 0.5, y = 0.45, labels = names[ord], srt = 90, xpd = NA, pos = 2)
 
-task = mlr3::TaskClassif$new(id = "data", 
+
+```
+
+```{r}
+task = mlr3::TaskClassif$new(id = "SSB_train", 
                              backend = complete_scaled[dat$dataset=="train",c(which_SBPA, predictor_groups$all)], 
                              target = "SBPA", positive = "1")
 model_rf = learner_rf$train(task)
@@ -250,33 +260,13 @@ imp = model_rf$importance()
 par(mfrow = c(1,1))
 bb = barplot(imp,names.arg = "", las = 1)
 text(x = bb[,1]+0.3, y = -4, labels = names(imp), xpd = NA, srt = 90, pos = 2)
-pred_rf = model_rf$predict(TaskClassif$new(id = "data", backend = complete_scaled[dat$dataset=="test",], target = "SBPA", positive = "1"))
+pred_rf = model_rf$predict(TaskClassif$new(id = "SSB_test_1", backend = complete_scaled[dat$dataset=="test",] %>% select(-SBDensity), target = "SBPA", positive = "1"))
+
 
 model_log_reg = learner_log_reg$train(task)
-pred_log_reg = model_log_reg$predict(TaskClassif$new(id = "data", backend = complete_scaled[dat$dataset=="test",], target = "SBPA", positive = "1"))
+pred_log_reg = model_log_reg$predict(TaskClassif$new(id = "SSB_test_2", backend = complete_scaled[dat$dataset=="test",] %>% select(-SBDensity), target = "SBPA", positive = "1"))
 
 test$SBPA_rf_wo_cover = pred_rf$data$prob[,1]
-
-```
-
-#### Model diagnostic Classification
-```{r}
-par(mfrow = c(1,1))
-hist(pred_rf$data$prob[,1], xlab = "SBPA Probability", main = "Predictions")
-
-explainer = function(object, newdata){
-  preds = object$predict_newdata(newdata=newdata)
-  return(preds$data$prob[,1])
-}
-
-# RF
-model_explainer_rf = DALEX::explain(model_rf, 
-                                    data=complete_scaled[dat$dataset=="train",c(-which_SBPA)], 
-                                    y=as.integer(complete_scaled[dat$dataset=="train",which_SBPA])-1L,
-                                    predict_function = explainer, label = "RF")
-dp = conditional_dependence(model_explainer_rf, variables = names(model_rf$importance())[1:12])
-plot(dp)
-
 ```
 
 
@@ -322,7 +312,7 @@ saveRDS(list(classification_rf = results_classification,
 
 ## Regression with SPBDensity
 ```{r}
-
+set.seed(42)
 results_regression = array(NA, dim = c(length(predictor_groups), 2, 9))
 rsq = msr("regr.rsq")
 
@@ -341,7 +331,7 @@ for(i in 1:length(predictor_groups)){
   res = result_rf$score(rsq)
   results_regression[i,1,] =  res$regr.rsq
   
-  learner_lm= lrn("regr.lm")
+  learner_lm= add_interactions( lrn("regr.cv_glmnet", nfolds = 3) )
   result_lm = resample(task, learner_lm, resampling, store_models = TRUE)
   res = result_lm$score(rsq)
   results_regression[i,2,] =  res$regr.rsq
@@ -380,7 +370,7 @@ pred_rf = model_rf$predict(TaskRegr$new(id = "data", backend = complete_scaled[d
 
 test$SBDensity_rf_wo_cover = exp(pred_rf$data$response)-0.001
 
-
+learner_lm = learner_lm$train(task)
 
 ```
 
@@ -413,40 +403,13 @@ for(i in 1:length(importance)){
 saveRDS(list(regression = results_regression, 
              names =  c("All", "Phylo", "Seed", "Env", "Phlyo+Seed", "Phylo+Env", "Env+Seed"),
              rf = model_rf,
-             lm = model_log_reg,
+             lm = learner_lm,
              cumulative = list(
                results = results_regression_cumulative,
                names =  names(sort(importance, decreasing = TRUE))
              )), file = "Results/regression.RDS")
 
 ```
-
-
-### Check predictions on train
-```{r}
-par(mfrow = c(1,2), mar = c(4,4,2,2))
-  task = mlr3::TaskRegr$new(id = "data", 
-                               backend = complete_scaled[dat$dataset=="train",c(which_SBDensity, predictor_groups$all)], 
-                               target = "SBDensity")
-
-plot(NULL, NULL, ylim = c(0, 12), xlim = c(0,12), xlab = "truth", ylab="predictions", las = 1, main = "RF")
-for(i in 1:9){
-  model_rf = learner_rf$train(task,row_ids = train_sets[[i]])
-  model_rf$importance()
-  pred_rf = model_rf$predict(task,row_ids = test_sets[[i]])
-  
-  points(pred_rf$data$truth, pred_rf$data$response)
-}
-
-plot(NULL, NULL, ylim = c(0, 12), xlim = c(0,12), xlab = "truth", ylab="predictions", las = 1, main = "kNN")
-for(i in 1:9){
-  model_lm = learner_lm$train(task,row_ids = train_sets[[i]])
-  pred_lm = model_lm$predict(task,row_ids = test_sets[[i]])
-  
-  points(pred_lm$data$truth, pred_lm$data$response)
-}
-```
-
 
 
 ## Save predictions

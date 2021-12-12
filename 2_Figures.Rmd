@@ -180,6 +180,8 @@ legend("topright", legend = "All predictors", lty = 3, bty = "n")
 
 predictors = names(classif_cumulative)[1:4]
 predictors[which(predictors == "T")] = "Temperature"
+predictors[which(predictors == "Cover")] = "Vegetation"
+predictors[which(predictors == "Weight")] = "Mass"
 for(i in 1:4){
   arrows(x_seq[i], y0 = values[i], y1 = values[i+1], lty = 1, length = 0.15, col = cols[1], lwd = 2.5)
   
@@ -217,6 +219,8 @@ text(x = 0.5, y = -0.1, pos = 1, labels = "Predictors", xpd = NA)
 
 predictors = names(regr_cumulative)[1:4]
 predictors[which(predictors == "T")] = "Temperature"
+predictors[which(predictors == "Cover")] = "Vegetation"
+predictors[which(predictors == "Weight")] = "Mass"
 for(i in 1:4){
   arrows(x_seq[i], y0 = values[i], y1 = values[i+1], lty = 1, length = 0.15, col = cols[1], lwd = 2.5)
   
@@ -249,7 +253,7 @@ dev.off()
 cols = addA(RColorBrewer::brewer.pal(3, "Dark2"), 0.5)
 # Env Phylo Seed
 seed=  c("Endosperm", "Weight", "Shape", "Productivity", "Dormancy")
-env =  c("T", "F", "N", "Grazing")
+env =  c("T", "F", "N", "Grazing", "Cover")
 pyhlogenetic = names(classif$rf$model$variable.importance)[grep( "c+[0-9]+",names(classif$rf$model$variable.importance))]
 
 
@@ -268,12 +272,21 @@ imp_regr = regr$rf$model$variable.importance
 pdf("Figures/Fig_3.pdf", width = 7.7, height = 7.7)
 par(mfrow = c(2, 1), mar = c(5,5, 1, 1), oma = rep(1,4))
 
-barplot(sort(imp_classif, decreasing = TRUE)/sum(imp_classif), las = 2, col = cols_class[order(imp_classif, decreasing = TRUE)], ylab = "importance")
-text(-5, 0.10, labels = "A", xpd = NA, font = 2, cex = 1.3)
+names = names(sort(imp_classif, decreasing = TRUE))
+names[which(names == "Cover", arr.ind = TRUE)] = "Vegetation"
+names[which(names == "Weight", arr.ind = TRUE)] = "Mass"
+names[which(names == "Productivity", arr.ind = TRUE)] = "Production"
+barplot(sort(imp_classif, decreasing = TRUE)/sum(imp_classif), las = 2, col = cols_class[order(imp_classif, decreasing = TRUE)], ylab = "Importance (Gini index) in %", names.arg = names)
+
+text(-4, 0.09, labels = "A", xpd = NA, font = 2, cex = 1.3)
 legend("topright", bty = "n", legend = c("Environment","Phylogeny", "Seed"), col = cols , pch = 15)
 
-barplot(sort(imp_regr, decreasing = TRUE)/sum(imp_regr), las = 2, col = cols_reg[order(imp_classif, decreasing = TRUE)], ylab = "importance")
-text(-5, 0.10, labels = "B", xpd = NA, font = 2, cex = 1.3)
+names = names(sort(imp_regr, decreasing = TRUE))
+names[which(names == "Cover", arr.ind = TRUE)] = "Vegetation"
+names[which(names == "Weight", arr.ind = TRUE)] = "Mass"
+names[which(names == "Productivity", arr.ind = TRUE)] = "Production"
+barplot(sort(imp_regr, decreasing = TRUE)/sum(imp_regr), las = 2, col = cols_reg[order(imp_classif, decreasing = TRUE)], ylab = "Importance (Gini index) in %", names.arg = names)
+text(-4, 0.09, labels = "B", xpd = NA, font = 2, cex = 1.3)
 
 
 dev.off()
@@ -350,9 +363,12 @@ plot_axis = function(w, mgp = c(3, 2, 0)) {
     
   pred = predict(lm(raw~scaled, data=data.frame(raw=reference[[w]], scaled=complete_scaled[[w]])), 
                    newdata=data.frame(scaled=dp_classif[dp_classif$vname==w,]$x))
+  
+  if(max(pred) > 1e5) digits = -4
+  else digits = 1
   axis(1, 
-       labels = (format(round(seq(min(pred), max(pred), length.out = 3), 1), 
-                        digits = 2, nsmall = 1)),
+       labels = (format(round(seq(min(pred), max(pred), length.out = 3), digits = digits), 
+                        digits =2, nsmall = 1)),
        at= seq(0, 1.0, length.out = 3), mgp =mgp)
   
 }
@@ -362,18 +378,18 @@ spar =  0.9
 ylim = c(0.1, 0.4)
 xlim = c(0.0, 1.0)
 par(mfrow = c(2, 7), mar = c(1, 0.15, 0.2, 0.15)+0.2, oma = c(4, 5, 2, 2))
-
+cex = 1.5
 counter = 1
-mains = c("Landolt' T", "Seed shape", "Seed weight", "Landolt' F", "Grazing", "Landolt' N", "Productivity")
+mains = c("Landolt' T", "Seed shape", "Seed mass", "Landolt' F", "Grazing", "Landolt' N", "Production")
 for(n in c("T", "Shape", "Weight", "F", "Grazing", "N", "Productivity")) {
   plot_dependence(dp_classif[dp_classif$vname==n,], ylim = ylim, spar = 0.0, col = "grey")
   plot_dependence(dp_classif[dp_classif$vname==n,], ylim = ylim, spar = 0.9, col = "black", new = FALSE)
   if(n == "T") {
     axis(side = 2, at = seq(0.1, 0.4, length.out = 4), labels = seq(0.1, 0.4, length.out = 4), xpd = NA, las = 1)
-    text(srt = 90, x = -0.37, y = 0.25, pos = 3, labels = "PA of SSB", xpd= NA)
+    text(srt = 90, x = -0.37, y = 0.25, pos = 3, labels = "PA of SSB", xpd= NA, cex = cex)
   }
-  text(x=0.01, pos = 3, y = 0.366, labels = LETTERS[counter], font = 2)
-  text(x = 0.5, pos = 3, y = 0.41, xpd = NA, labels = mains[counter])
+  text(x=0.01, pos = 3, y = 0.366, labels = LETTERS[counter], font =2)
+  text(x = 0.5, pos = 3, y = 0.41, xpd = NA, labels = mains[counter], cex = cex)
   counter = counter + 1
 }
 
@@ -387,13 +403,59 @@ for(n in c("T", "Shape", "Weight", "F", "Grazing", "N", "Productivity")) {
   else mgp = c(3, 1, 0)
   if(n == "T") {
     axis(side = 2, at = seq(0.0, 130, length.out = 6), labels = seq(0.0, 130, length.out = 6), xpd = NA, las = 1)
-    text(srt = 90, x = -0.37, y = 60, pos = 3, labels = "SSB Density", xpd= NA)
+    text(srt = 90, x = -0.37, y = 60, pos = 3, labels = "SSB Density", xpd= NA, cex = cex)
   }
   text(x=0.01, pos = 3, y = 115.95, labels = LETTERS[counter], font = 2)
   counter = counter + 1
+  if(n == "F") text(x = 0.5, y = -70, xpd = NA, labels = "Predictor values", cex = cex)
 }
 
 dev.off()
 
+```
+
+## Figure - S1 Correlation
+```{r}
+library(corrplot)
+data = complete_scaled[,-c(1,2)]
+names = colnames(data)
+colnames(data)[which(names == "Cover", arr.ind = TRUE)] = "Vegetation"
+colnames(data)[which(names == "Weight", arr.ind = TRUE)] = "Mass"
+
+pdf("Figures/Fig_S1.pdf", width = 7, height = 8)
+
+par(mfrow = c(1,1))
+corrplot(cor(data), type="upper")
+dev.off()
+```
+
+## Figure - S2 Effect sizes
+```{r}
+library(glmnet)
+pdf("Figures/Fig_S2.pdf", width = 9, height = 8)
+par(mfrow = c(2, 1), oma = c(5, 2, 2, 2))
+classification = readRDS("Results/classification.RDS")
+model = classification$lm$model$classif.cv_glmnet$model
+tmp_coeffs = coef(model, s = "lambda.min")
+effects = data.frame(name = tmp_coeffs@Dimnames[[1]][tmp_coeffs@i + 1], 
+                     coefficient = tmp_coeffs@x)
+sub = effects[order(abs(effects$coefficient), decreasing = TRUE),][1:30,]
+bars = sub$coefficient
+names(bars) = sub$name
+barplot(abs(bars), las = 2)
+text(-2, 1.2, label = "A", font = 2, xpd = NA)
+
+regression = readRDS("Results/regression.RDS")
+model = regression$lm$model$regr.cv_glmnet$model
+tmp_coeffs = coef(model, s = "lambda.min")
+effects = data.frame(name = tmp_coeffs@Dimnames[[1]][tmp_coeffs@i + 1], 
+                     coefficient = tmp_coeffs@x)
+sub = effects[order(abs(effects$coefficient), decreasing = TRUE),][1:30,]
+bars = sub$coefficient
+names(bars) = sub$name
+barplot(abs(bars), las = 2)
+text(-2, 4, label = "B", font = 2, xpd = NA)
+
+dev.off()
 ```
 
