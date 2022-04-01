@@ -9,6 +9,8 @@ easily available traits.
 
 ## Data
 
+Data for this study can be found in the ‘Data’ subfolder.
+
 ## Methods
 
 Data preparation, the ML pipeline for SSB density and PA can be found in
