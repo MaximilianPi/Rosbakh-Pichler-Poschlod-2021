@@ -8,3 +8,4 @@
 *.tre
 *.csv
 
+.DS_Store

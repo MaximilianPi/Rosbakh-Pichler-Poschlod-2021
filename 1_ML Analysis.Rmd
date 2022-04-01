@@ -90,7 +90,7 @@ data = rbind(train, test)
 
 
 ### Adding phlyogenetic eigenvectors ( following the "phylogeny" script )
-I decided to use only the n eigenvectors that explain maximal 60% of the variance to reduce the overall number of predictors
+We decided to use only the n eigenvectors that explain maximal 60% of the variance to reduce the overall number of predictors
 ```{r}
 Species = 
   data %>% 
@@ -414,6 +414,6 @@ saveRDS(list(regression = results_regression,
 
 ## Save predictions
 ```{r}
-write.csv(test, file = "results/full_data_w_predictions.csv")
+write.csv(test, file = "Results/full_data_w_predictions.csv")
 ```
 
